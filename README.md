@@ -23,8 +23,9 @@ with the GGUF file name when a model does not load.
   streamed), image input, batched sessions, and RAM and disk prompt caching.
 - `gufo prompt` and `gufo bench` through the extension's drivers.
 - Provider options: `--image-tokens`, `--draft-calibration`, `--draft-trace` and
-  `--prefill-weights`. MTP drafts up to 15 tokens with the calibrated policy
-  unless `--draft-tokens` or `--draft-policy` say otherwise.
+  `--prefill-weights`. MTP drafts up to 15 tokens with the calibrated policy;
+  Gufo ignores `--draft-tokens`, `--min-draft-tokens` and `--draft-policy`
+  since [#1124](https://github.com/gufo-org/gufo/pull/1124).
 
 Benchmarks and quality reports are in the model cards:
 [26B-A4B](docs/models/gemma-4-26b-a4b/README.md),
@@ -51,6 +52,13 @@ functional suites pass on both, apart from `image-count` below.
 
 Not repeated on this build: QAT, and the complete functional set.
 
+On Gufo `f01a4570` (extension API 0.3.0, November 11, 2026), with 26B-A4B
+Unsloth UD-Q4_K_M, the Q8_0 MTP drafter and the BF16 projector, ROCm 10.1:
+the CPU tests, the GPU operator tests and `gemma4.target`, `continuation`,
+`continuation_perturbed`, `vision_encoder` and `vision_session` pass, as do
+the `sampling-defaults` and `tool-native-schemas` functional suites (MTP).
+The 31B models, QAT and the remaining suites were not run on this revision.
+
 ## Known limits
 
 - The functional suites `image-detail` (it assumes Qwen's image token counts)
@@ -58,12 +66,15 @@ Not repeated on this build: QAT, and the complete functional set.
   fail for those test reasons.
 - In-place same-slot restore and shared transfer streams (batches of 256 jobs
   instead of 16) are not upstream.
-- The Python tools in `tools/` are untested here.
+- The Python tools in `tools/` are untested here. `draft_policy_bench.py` and
+  `proposal_replay.py` select policies and draft counts with Gufo's draft
+  flags, which Gufo now ignores.
 
 ## Build with Gufo
 
-The extension needs extension API 0.2.14 (upstream `main` since
-[#1047](https://github.com/gufo-org/gufo/pull/1047)).
+The extension needs extension API 0.3.0 (upstream `main` since
+[#1118](https://github.com/gufo-org/gufo/pull/1118)); `flake.lock` pins the
+Gufo revision it was last built and tested with.
 
 ```sh
 git clone https://github.com/gufo-org/gufo

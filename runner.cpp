@@ -283,6 +283,11 @@ public:
         .retained_snapshot_capacity_bytes = snapshot_capacity,
         .retained_snapshot_ceiling_bytes = snapshot_ceiling,
         .requires_device_runtime_lock = true,
+        // Sessions allocate their whole context up front
+        // (per_request_state_bytes), so prompts commit no further state.
+        .prompt_state_bytes_per_token = std::nullopt,
+        .prompt_admission_budget_bytes = std::nullopt,
+        .prompt_admission_available_bytes = {},
     };
   }
 
