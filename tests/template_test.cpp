@@ -247,6 +247,28 @@ void CheckClosedThoughtAfterTool() {
           "thinking opens the thought block");
 }
 
+/// Replayed call arguments keep the numbers' spelling, as Python reads JSON:
+/// an integer token exactly, any other number as a float.
+void CheckReplayedNumbers() {
+  using gufo::ext::ChatMessage;
+  using gufo::ext::ChatRole;
+  ChatMessage call(ChatRole::kAssistant, "");
+  call.tool_calls.push_back({.id = "c",
+                             .name = "tag",
+                             .arguments = {{"id", "9007199254740993", false},
+                                           {"weight", "1.0", false},
+                                           {"zero", "-0", false}}});
+  const std::vector<ChatMessage> history{ChatMessage(ChatRole::kUser, "Tag."),
+                                         call};
+  std::string error;
+  const auto rendered = g4::ChatTemplate::Render(history, {}, {}, &error);
+  Require(rendered.has_value(), "conversation rendered: " + error);
+  Require(
+      rendered->text.find("call:tag{id:9007199254740993,weight:1.0,zero:0}") !=
+          std::string::npos,
+      "replayed numbers: " + rendered->text);
+}
+
 void CheckReplacedFinalUserTurn() {
   using gufo::ext::ChatMessage;
   using gufo::ext::ChatRole;
@@ -331,6 +353,7 @@ int main() {
     CheckReplayedThought();
     CheckFramingSuffix();
     CheckClosedThoughtAfterTool();
+    CheckReplayedNumbers();
     CheckReplacedFinalUserTurn();
   });
 }

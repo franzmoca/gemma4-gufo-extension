@@ -94,12 +94,22 @@ std::string PyFloat(double x) {
   return out + digits.substr(0, int_digits) + "." + digits.substr(int_digits);
 }
 
-std::string PyNumber(double x) {
-  // gufo::json keeps numbers as doubles; integral values print as ints.
-  if (std::isfinite(x) && std::floor(x) == x && std::fabs(x) < 9.0e15) {
-    return std::to_string(static_cast<long long>(x));
+std::string PyNumber(const Value& v) {
+  // Python reads a JSON integer token as an exact int and any other number
+  // as a float. A number Gufo parsed keeps its token; one built in C++ spells
+  // integral values up to 2^53 as integers.
+  const double x = v.as_double();
+  if (!std::isfinite(x)) {
+    return PyFloat(x);
   }
-  return PyFloat(x);
+  std::string token = v.dump(Value::Numbers::kAsParsed);
+  if (token.find_first_of(".eE") != std::string::npos) {
+    return PyFloat(x);
+  }
+  if (token.find_first_not_of("-0") == std::string::npos) {
+    return "0";
+  }
+  return token;
 }
 
 std::string PyStrRepr(const std::string& s) {
@@ -170,7 +180,7 @@ std::string PyStr(const Value& v) {
     return v.as_bool() ? "True" : "False";
   }
   if (v.is_number()) {
-    return PyNumber(v.as_double());
+    return PyNumber(v);
   }
   if (v.is_string()) {
     return v.str();
