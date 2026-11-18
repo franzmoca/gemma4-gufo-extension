@@ -359,6 +359,10 @@ const Config& Model::config() const noexcept {
   return weights_->config;
 }
 
+expert_stream::Store* Model::ExpertStore() const noexcept {
+  return device_->expert_store();
+}
+
 std::size_t Model::ResidentBytes() const noexcept {
   return device_->resident_bytes() +
          rocm::Executor::ScratchBytes(

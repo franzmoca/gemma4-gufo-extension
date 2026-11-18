@@ -27,6 +27,9 @@
 namespace gufo::core {
 class GgufReader;
 }
+namespace gufo::expert_stream {
+class Store;
+}
 
 namespace gufo::models::gemma4 {
 
@@ -201,6 +204,8 @@ public:
     return *reader_;
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// The streamed experts' store (ModelOptions::stream_experts), or null.
+  [[nodiscard]] expert_stream::Store* ExpertStore() const noexcept;
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
   /// Sliding-window ring slots per session (window + prefill chunk).
   [[nodiscard]] std::size_t SessionRingSlots() const noexcept;

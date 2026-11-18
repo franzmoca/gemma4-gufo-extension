@@ -40,6 +40,12 @@ using ext::TextRunnerToken;
 // Each Gemma 4 request owns its KV cache (global rows plus the sliding-window
 // ring) and its snapshots; forwards of different requests are serialized.
 constexpr std::string_view kStateAbi = "gemma4-rocm-session-v1";
+// With streamed experts, serving sizes the expert cache after the sessions:
+// it leaves this much host memory free (buffers and transient peaks the
+// first requests still allocate), and bounds the automatic prompt cache to
+// this share per session.
+constexpr std::size_t kExpertHeadroomBytes = std::size_t{2} << 30;
+constexpr std::size_t kStreamedRamShareBytes = std::size_t{1} << 30;
 
 TokenId EngineToken(TextRunnerToken token) {
   if (token >
@@ -303,6 +309,12 @@ public:
       snapshot_capacity = std::min(snapshot_capacity, *capacity);
       snapshot_ceiling = std::min(snapshot_ceiling, *capacity);
     }
+    ext::TextRunnerExpertCacheClaim experts{};
+    if (auto* store = model_->ExpertStore()) {
+      experts.store = store;
+      experts.headroom_bytes = kExpertHeadroomBytes;
+      experts.prompt_cache_share_per_session_bytes = kStreamedRamShareBytes;
+    }
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
@@ -316,6 +328,7 @@ public:
         .prompt_state_bytes_per_token = std::nullopt,
         .prompt_admission_budget_bytes = std::nullopt,
         .prompt_admission_available_bytes = {},
+        .expert_cache = experts,
     };
   }
 
