@@ -204,7 +204,8 @@ __global__ void __launch_bounds__(kThreads)
                            float* __restrict__ out,
                            __half* __restrict__ out_half, std::uint32_t m,
                            std::uint32_t k, std::uint32_t dense_rows = 0,
-                           std::uint32_t dense_group = 0) {
+                           std::uint32_t dense_group = 0,
+                           const void* const* __restrict__ table = nullptr) {
   constexpr bool kQ6 = F == ExpertFormat::kQ6_K;
   constexpr bool kQ4 = F == ExpertFormat::kQ4_K;
   constexpr int kStride = kRowStride<F>;
@@ -289,6 +290,9 @@ __global__ void __launch_bounds__(kThreads)
       kGrouped
           ? w + (std::size_t{f_mrow / 128} * 128 * (k / 256) + f_mrow % 128) *
                     kBlockBytes<F>
+      : table != nullptr
+          ? static_cast<const std::uint8_t*>(table[expert]) +
+                std::size_t{f_mrow} * row_bytes
           : w + (std::size_t{static_cast<std::uint32_t>(expert)} * m + f_mrow) *
                     row_bytes;
   const std::size_t f_step =
@@ -998,7 +1002,8 @@ __global__ void __launch_bounds__(kThreads)
                          float* __restrict__ out, __half* __restrict__ out_half,
                          std::uint32_t m, std::uint32_t k,
                          std::uint32_t dense_rows = 0,
-                         std::uint32_t dense_group = 0) {
+                         std::uint32_t dense_group = 0,
+                         const void* const* __restrict__ table = nullptr) {
   constexpr bool kQ8 = F == ExpertFormat::kQ8_0;
   // Q8_0, Q4_0 and Q5_0 rows are only 2-byte aligned: staged as words.
   constexpr bool kSmall = F == ExpertFormat::kQ4_0 || F == ExpertFormat::kQ5_0;
@@ -1059,7 +1064,9 @@ __global__ void __launch_bounds__(kThreads)
   const std::uint32_t half_m = m / 2;
   const std::size_t row_bytes = std::size_t{k} / 32 * kDownBlockBytes<F>;
   const std::uint8_t* w_expert =
-      w + std::size_t{static_cast<std::uint32_t>(expert)} * m * row_bytes;
+      table != nullptr
+          ? static_cast<const std::uint8_t*>(table[expert])
+          : w + std::size_t{static_cast<std::uint32_t>(expert)} * m * row_bytes;
   // Block row l's matrix row: kGeGlu, gate rows then their up rows.
   const auto matrix_row = [&](int l) -> std::uint32_t {
     if constexpr (kGeGlu) {
@@ -1599,12 +1606,15 @@ bool LaunchDenseHalfGemm(ExpertFormat format, const void* w, const void* x,
   }
 }
 
-bool LaunchRoutedHalfGemm(
-    ExpertFormat format, const void* w, const void* x,
-    const std::int32_t* tiles, std::uint32_t n_tiles, std::uint32_t tile_rows,
-    const std::int32_t* pad_bounds, const std::int32_t* rows_in,
-    const std::int32_t* rows_out, float* out, void* out_half, std::uint32_t m,
-    std::uint32_t k, hipStream_t stream, bool geglu, PrefillLayout layout) {
+bool LaunchRoutedHalfGemm(ExpertFormat format, const void* w, const void* x,
+                          const std::int32_t* tiles, std::uint32_t n_tiles,
+                          std::uint32_t tile_rows,
+                          const std::int32_t* pad_bounds,
+                          const std::int32_t* rows_in,
+                          const std::int32_t* rows_out, float* out,
+                          void* out_half, std::uint32_t m, std::uint32_t k,
+                          hipStream_t stream, bool geglu, PrefillLayout layout,
+                          const void* const* table) {
   if (tile_rows != kRoutedHalfTileRows || n_tiles == 0 ||
       (out == nullptr) == (out_half == nullptr) ||
       (format != ExpertFormat::kQ5_1 && format != ExpertFormat::kQ8_0 &&
@@ -1624,7 +1634,9 @@ bool LaunchRoutedHalfGemm(
   const auto* xh = static_cast<const __half*>(x);
   auto* oh = static_cast<__half*>(out_half);
   if (layout == PrefillLayout::kCompact) {
-    if (!PrefillLayoutSupports(format, layout, k) || m % 16 != 0) {
+    // The compact copy packs every expert's rows together: no table.
+    if (!PrefillLayoutSupports(format, layout, k) || m % 16 != 0 ||
+        table != nullptr) {
       return false;
     }
     const auto compact = [&]<ExpertFormat F>() {
@@ -1659,34 +1671,40 @@ bool LaunchRoutedHalfGemm(
     case ExpertFormat::kQ4_K:
       if (geglu) {
         RoutedHalfKQuantKernel<ExpertFormat::kQ4_K, kRoutedHalfTileRows, true>
-            <<<geglu_grid, kThreads, 0, stream>>>(
-                wb, xh, tiles, pad_bounds, rows_in, rows_out, out, oh, m, k);
+            <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
+                                                  rows_in, rows_out, out, oh, m,
+                                                  k, 0, 0, table);
       } else {
         RoutedHalfKQuantKernel<ExpertFormat::kQ4_K, kRoutedHalfTileRows>
             <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                            rows_out, out, oh, m, k);
+                                            rows_out, out, oh, m, k, 0, 0,
+                                            table);
       }
       return true;
     case ExpertFormat::kQ5_K:
       if (geglu) {
         RoutedHalfKQuantKernel<ExpertFormat::kQ5_K, kRoutedHalfTileRows, true>
-            <<<geglu_grid, kThreads, 0, stream>>>(
-                wb, xh, tiles, pad_bounds, rows_in, rows_out, out, oh, m, k);
+            <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
+                                                  rows_in, rows_out, out, oh, m,
+                                                  k, 0, 0, table);
       } else {
         RoutedHalfKQuantKernel<ExpertFormat::kQ5_K, kRoutedHalfTileRows>
             <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                            rows_out, out, oh, m, k);
+                                            rows_out, out, oh, m, k, 0, 0,
+                                            table);
       }
       return true;
     case ExpertFormat::kQ6_K:
       if (geglu) {
         RoutedHalfKQuantKernel<ExpertFormat::kQ6_K, kRoutedHalfTileRows, true>
-            <<<geglu_grid, kThreads, 0, stream>>>(
-                wb, xh, tiles, pad_bounds, rows_in, rows_out, out, oh, m, k);
+            <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
+                                                  rows_in, rows_out, out, oh, m,
+                                                  k, 0, 0, table);
       } else {
         RoutedHalfKQuantKernel<ExpertFormat::kQ6_K, kRoutedHalfTileRows>
             <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                            rows_out, out, oh, m, k);
+                                            rows_out, out, oh, m, k, 0, 0,
+                                            table);
       }
       return true;
     case ExpertFormat::kQ5_1:
@@ -1695,7 +1713,8 @@ bool LaunchRoutedHalfGemm(
       }
       RoutedHalfDownKernel<ExpertFormat::kQ5_1, kRoutedHalfTileRows>
           <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                          rows_out, out, nullptr, m, k);
+                                          rows_out, out, nullptr, m, k, 0, 0,
+                                          table);
       return true;
     case ExpertFormat::kQ8_0:
       if (k % kDownStageK != 0 || (out == nullptr) != geglu) {
@@ -1705,11 +1724,12 @@ bool LaunchRoutedHalfGemm(
         RoutedHalfDownKernel<ExpertFormat::kQ8_0, kRoutedHalfTileRows, true>
             <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
                                                   rows_in, rows_out, nullptr,
-                                                  oh, m, k);
+                                                  oh, m, k, 0, 0, table);
       } else {
         RoutedHalfDownKernel<ExpertFormat::kQ8_0, kRoutedHalfTileRows>
             <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                            rows_out, out, nullptr, m, k);
+                                            rows_out, out, nullptr, m, k, 0, 0,
+                                            table);
       }
       return true;
     case ExpertFormat::kQ4_0:
@@ -1720,11 +1740,12 @@ bool LaunchRoutedHalfGemm(
         RoutedHalfDownKernel<ExpertFormat::kQ4_0, kRoutedHalfTileRows, true>
             <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
                                                   rows_in, rows_out, nullptr,
-                                                  oh, m, k);
+                                                  oh, m, k, 0, 0, table);
       } else {
         RoutedHalfDownKernel<ExpertFormat::kQ4_0, kRoutedHalfTileRows>
             <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                            rows_out, out, nullptr, m, k);
+                                            rows_out, out, nullptr, m, k, 0, 0,
+                                            table);
       }
       return true;
     case ExpertFormat::kQ5_0:
@@ -1733,7 +1754,8 @@ bool LaunchRoutedHalfGemm(
       }
       RoutedHalfDownKernel<ExpertFormat::kQ5_0, kRoutedHalfTileRows>
           <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                          rows_out, out, nullptr, m, k);
+                                          rows_out, out, nullptr, m, k, 0, 0,
+                                          table);
       return true;
     case ExpertFormat::kF16:
       if (k % kDownStageK != 0 || (out == nullptr) != geglu) {
@@ -1743,11 +1765,12 @@ bool LaunchRoutedHalfGemm(
         RoutedHalfDownKernel<ExpertFormat::kF16, kRoutedHalfTileRows, true>
             <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
                                                   rows_in, rows_out, nullptr,
-                                                  oh, m, k);
+                                                  oh, m, k, 0, 0, table);
       } else {
         RoutedHalfDownKernel<ExpertFormat::kF16, kRoutedHalfTileRows>
             <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
-                                            rows_out, out, nullptr, m, k);
+                                            rows_out, out, nullptr, m, k, 0, 0,
+                                            table);
       }
       return true;
     default:

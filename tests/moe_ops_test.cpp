@@ -99,6 +99,40 @@ std::vector<T> Host(const T* device, std::size_t n) {
   return out;
 }
 
+/// Each expert of a stacked [experts][m][k] matrix (expert_bytes each) in
+/// its own allocation, made in reverse order so no two neighbours touch, and
+/// the device table of their addresses: what an expert store's Prepare hands
+/// the kernels. Each keeps RandomMatrix's 4 KiB of slack past its end.
+template<class T>
+bool SameBytes(const std::vector<T>& a, const std::vector<T>& b) {
+  return a.size() == b.size() &&
+         std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+}
+
+struct ScatteredExperts {
+  std::vector<void*> buffers;
+  const void* const* table = nullptr;
+  ScatteredExperts(const std::vector<std::uint8_t>& w, std::size_t experts,
+                   std::size_t bytes) {
+    buffers.resize(experts);
+    for (std::size_t e = experts; e-- > 0;) {
+      HIP_CHECK(hipMalloc(&buffers[e], bytes + 4096));
+      HIP_CHECK(hipMemset(buffers[e], 0xFF, bytes + 4096));
+      HIP_CHECK(hipMemcpy(buffers[e], w.data() + e * bytes, bytes,
+                          hipMemcpyHostToDevice));
+    }
+    table = Device(const_cast<const void* const*>(buffers.data()), experts);
+  }
+  ~ScatteredExperts() {
+    for (void* b : buffers) {
+      HIP_CHECK(hipFree(b));
+    }
+    HIP_CHECK(hipFree(const_cast<const void**>(table)));
+  }
+  ScatteredExperts(const ScatteredExperts&) = delete;
+  ScatteredExperts& operator=(const ScatteredExperts&) = delete;
+};
+
 std::vector<float> Normal(std::size_t n, float sigma, std::mt19937& rng) {
   std::normal_distribution<float> dist(0.0F, sigma);
   std::vector<float> v(n);
@@ -370,8 +404,11 @@ void CheckProjection(const Format& f, std::uint32_t m, std::uint32_t k,
   std::int32_t* dg = nullptr;
   HIP_CHECK(hipMalloc(&dg, g4k::ExpertGroupInts(kExperts) * 4));
 
+  const ScatteredExperts scattered(w, max_expert,
+                                   std::size_t{m} * (k / f.block * f.bytes));
   const auto run = [&](std::uint32_t first_row, std::uint32_t rows,
-                       bool single = false) {
+                       bool single = false,
+                       const void* const* experts = nullptr) {
     std::vector<std::int32_t> sub(ids.begin() + first_row * kUsed,
                                   ids.begin() + (first_row + rows) * kUsed);
     const auto table = Groups(sub);
@@ -379,12 +416,20 @@ void CheckProjection(const Format& f, std::uint32_t m, std::uint32_t k,
         hipMemcpy(dg, table.data(), table.size() * 4, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemset(dy, 0xFF, std::size_t{rows} * kUsed * m * 4));
     const float* xin = dx + std::size_t{first_row} * kUsed / x_div * k;
-    Require(g4k::LaunchRoutedGemv(f.format, dw, dg, rows * kUsed, xin, x_div,
-                                  dy, m, k, nullptr, false, single),
+    Require(g4k::LaunchRoutedGemv(f.format, experts ? nullptr : dw, dg,
+                                  rows * kUsed, xin, x_div, dy, m, k, nullptr,
+                                  false, single, experts),
             name + ": shape rejected");
     return Host(dy, std::size_t{rows} * kUsed * m);
   };
   const auto all = run(0, kRows);
+  // Scattered experts through a table, bit for bit, batched and one-row.
+  Require(SameBytes(run(0, kRows, false, scattered.table), all),
+          name + ": the expert table differs from the stacked weights");
+  Require(std::memcmp(run(2, 1, true, scattered.table).data(),
+                      &all[std::size_t{2} * kUsed * m],
+                      std::size_t{kUsed} * m * 4) == 0,
+          name + ": the one-slot expert table differs");
 
   // Against FP64 dots of the dequantized rows (sampled).
   const std::size_t row_bytes = k / f.block * f.bytes;
@@ -431,7 +476,8 @@ void CheckProjection(const Format& f, std::uint32_t m, std::uint32_t k,
   if (x_div == kUsed) {
     const std::uint32_t width = m / 2;
     const auto run_geglu = [&](std::uint32_t first_row, std::uint32_t rows,
-                               bool single = false) {
+                               bool single = false,
+                               const void* const* experts = nullptr) {
       std::vector<std::int32_t> sub(ids.begin() + first_row * kUsed,
                                     ids.begin() + (first_row + rows) * kUsed);
       const auto table = Groups(sub);
@@ -439,12 +485,15 @@ void CheckProjection(const Format& f, std::uint32_t m, std::uint32_t k,
           hipMemcpy(dg, table.data(), table.size() * 4, hipMemcpyHostToDevice));
       HIP_CHECK(hipMemset(dy, 0xFF, std::size_t{rows} * kUsed * width * 4));
       const float* xin = dx + std::size_t{first_row} * kUsed / x_div * k;
-      Require(g4k::LaunchRoutedGemv(f.format, dw, dg, rows * kUsed, xin, x_div,
-                                    dy, m, k, nullptr, true, single),
+      Require(g4k::LaunchRoutedGemv(f.format, experts ? nullptr : dw, dg,
+                                    rows * kUsed, xin, x_div, dy, m, k, nullptr,
+                                    true, single, experts),
               name + ": GeGLU shape rejected");
       return Host(dy, std::size_t{rows} * kUsed * width);
     };
     const auto fused = run_geglu(0, kRows);
+    Require(SameBytes(run_geglu(0, kRows, false, scattered.table), fused),
+            name + ": the expert table's GeGLU differs");
     double geglu_worst = 0.0;
     for (std::size_t s = 0; s < std::size_t{kRows} * kUsed; ++s) {
       for (std::uint32_t c = 0; c < width; ++c) {
@@ -675,6 +724,22 @@ void CheckRoutedPrefill(const Format& f, std::uint32_t m, std::uint32_t k,
                                     nullptr, m, k, nullptr),
           "routed prefill GEMM rejected " + std::string(f.name));
   const auto got = Host(dy, slots * m);
+  const ScatteredExperts scattered(w, kExpertsHere,
+                                   std::size_t{m} * (k / f.block * f.bytes));
+  HIP_CHECK(hipMemset(dy, 0, slots * m * sizeof(float)));
+  Require(g4k::LaunchRoutedHalfGemm(
+              f.format, nullptr, dx, dtiles,
+              static_cast<std::uint32_t>(tiles.size()), kTile, bounds,
+              rows_token, rows_slot, dy, nullptr, m, k, nullptr, false,
+              g4k::PrefillLayout::kNone, scattered.table) &&
+              SameBytes(Host(dy, slots * m), got),
+          std::string(f.name) + ": routed prefill through the table differs");
+  Require(
+      !g4k::LaunchRoutedHalfGemm(
+          f.format, dw, dx, dtiles, static_cast<std::uint32_t>(tiles.size()),
+          kTile, bounds, rows_token, rows_slot, dy, nullptr, m, k, nullptr,
+          false, g4k::PrefillLayout::kCompact, scattered.table),
+      std::string(f.name) + ": the compact layout took a table");
   // The compact prefill copy of all experts, bit for bit (FP32 and GeGLU).
   if (g4k::PrefillLayoutSupports(f.format, g4k::PrefillLayout::kCompact, k)) {
     const auto n_tiles = static_cast<std::uint32_t>(tiles.size());
@@ -762,6 +827,14 @@ void CheckRoutedPrefill(const Format& f, std::uint32_t m, std::uint32_t k,
             "fused GeGLU routed prefill rejected");
     const auto a = Host(want, slots * width);
     const auto b = Host(fused, slots * width);
+    Require(g4k::LaunchRoutedHalfGemm(
+                f.format, nullptr, dx, dtiles, n_tiles, kTile, bounds,
+                rows_token, rows_slot, nullptr, fused, m, k, nullptr, true,
+                g4k::PrefillLayout::kNone, scattered.table),
+            "fused GeGLU routed prefill through the table rejected");
+    const auto c = Host(fused, slots * width);
+    Require(std::memcmp(b.data(), c.data(), c.size() * 2) == 0,
+            std::string(f.name) + ": fused GeGLU through the table differs");
     Require(
         std::memcmp(a.data(), b.data(), a.size() * 2) == 0,
         std::string(f.name) + ": fused GeGLU differs from the separate pass");
@@ -796,6 +869,14 @@ void CheckRoutedPrefill(const Format& f, std::uint32_t m, std::uint32_t k,
     Require(
         std::memcmp(flash.data(), got.data(), got.size() * sizeof(float)) == 0,
         std::string(f.name) + " routed prefill differs from RoutedF16Gemm");
+    HIP_CHECK(hipMemset(dy, 0, slots * m * sizeof(float)));
+    Require(
+        hg::RoutedF16Gemm(nullptr, type, reinterpret_cast<const __half*>(dx),
+                          dtiles48, static_cast<std::uint32_t>(tiles48.size()),
+                          rows, bounds, rows_token, rows_slot, dy, nullptr, m,
+                          k, nullptr, scattered.table) &&
+            SameBytes(Host(dy, slots * m), flash),
+        std::string(f.name) + ": RoutedF16Gemm through the table differs");
     HIP_CHECK(hipFree(dtiles48));
   }
   const std::size_t row_bytes = k / f.block * f.bytes;

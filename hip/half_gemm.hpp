@@ -83,13 +83,14 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// `tile_rows` is the token rows per tile the map was built with: 16 or 48,
 /// or 64 for Q5_1/Q8_0.
 /// Q4_K and Q5_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other types
-/// and tile widths return false.
+/// and tile widths return false. A non-null `table` ([experts] device
+/// pointers) gives each expert's [m][k] weights in place of w's stack.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,
                    const std::int32_t* rows_in, const std::int32_t* rows_out,
                    float* out, __half* out_half, std::size_t m, std::size_t k,
-                   hipStream_t stream);
+                   hipStream_t stream, const void* const* table = nullptr);
 
 /// Number of IDs in each of the two selection buffers.
 std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);

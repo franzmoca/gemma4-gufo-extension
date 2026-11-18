@@ -86,14 +86,15 @@ void MoeRoute(const MoeRouteArgs& args, hipStream_t stream);
 /// `geglu`, W holds fused [gate | up] rows (m even) and y[s][0..m / 2)
 /// receives gelu_tanh(gate) * up instead. `single` (every group holds one
 /// slot: one-row decode) takes a one-slot build of the same arithmetic.
-/// Returns false without launching for unsupported shapes.
-[[nodiscard]] bool LaunchRoutedGemv(ExpertFormat format, const void* w,
-                                    const std::int32_t* groups,
-                                    std::uint32_t max_groups, const float* x,
-                                    std::uint32_t x_div, float* y,
-                                    std::uint32_t m, std::uint32_t k,
-                                    hipStream_t stream, bool geglu = false,
-                                    bool single = false);
+/// A non-null `table` ([experts] device pointers, as an expert store's
+/// Prepare returns) gives each expert's [m][k] weights in place of W's
+/// stack; w is then unused. Returns false without launching for unsupported
+/// shapes.
+[[nodiscard]] bool LaunchRoutedGemv(
+    ExpertFormat format, const void* w, const std::int32_t* groups,
+    std::uint32_t max_groups, const float* x, std::uint32_t x_div, float* y,
+    std::uint32_t m, std::uint32_t k, hipStream_t stream, bool geglu = false,
+    bool single = false, const void* const* table = nullptr);
 
 /// Dense projection of `rows` (1..kMaxGroupSlots) FP32 activation rows x
 /// ([rows][k]) with LaunchRoutedGemv's arithmetic over one expert: y[r] =
@@ -147,14 +148,16 @@ inline constexpr std::uint32_t kRoutedHalfTileRows = 112;
 /// [gate | up] W, binary16 output) row r of `out_half` holds the m / 2 values
 /// GeGluPackedHalf would make of the binary16 pair. `layout` kCompact reads
 /// W as a K-quant's compact prefill copy of all experts' rows (m % 16 == 0),
-/// with the same results.
+/// with the same results. A non-null `table` (layout kNone only) gives each
+/// expert's [m][k] weights in place of W's stack, as in LaunchRoutedGemv.
 [[nodiscard]] bool LaunchRoutedHalfGemm(
     ExpertFormat format, const void* w, const void* x,
     const std::int32_t* tiles, std::uint32_t n_tiles, std::uint32_t tile_rows,
     const std::int32_t* pad_bounds, const std::int32_t* rows_in,
     const std::int32_t* rows_out, float* out, void* out_half, std::uint32_t m,
     std::uint32_t k, hipStream_t stream, bool geglu = false,
-    PrefillLayout layout = PrefillLayout::kNone);
+    PrefillLayout layout = PrefillLayout::kNone,
+    const void* const* table = nullptr);
 
 /// Dense prefill projection over binary16 activation rows `x` ([rows][k])
 /// for Q4_K, Q5_K, Q6_K (the routed GEMM's arithmetic over an identity
