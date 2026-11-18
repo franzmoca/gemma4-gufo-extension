@@ -993,7 +993,7 @@ void Executor::Forward(std::span<const Segment> segments,
             half ? x_half_ : Quantize(attn_, n, c.QDim(l)), n, o_,
             attn_pack.hi != nullptr);
     // Expert layers also normalize the attention residual for the experts.
-    const bool moe = !L.gate_up_exps.empty();
+    const bool moe = !L.router.empty();
     const bool dense_half_only = !L.ffn_gate_up.empty()
                                      ? half_only({&L.ffn_gate_up})
                                      : half_only({&L.ffn_gate, &L.ffn_up});
@@ -1018,12 +1018,17 @@ void Executor::Forward(std::span<const Segment> segments,
                                             : Quantize(h_, n, d);
     // At grouped widths the experts run beside the dense MLP on their own
     // stream: routing is latency bound, the projections bandwidth bound.
+    // A streamed layer's routing waits on the host, so its experts queue
+    // after the dense MLP, which then runs during that wait.
     const bool concurrent = moe && n <= kMaxGroupSlots;
+    const bool experts_after_dense = concurrent && L.expert_stream_layer >= 0;
     if (concurrent) {
       HIP_CHECK(hipEventRecord(expert_fork_, stream_));
       HIP_CHECK(hipStreamWaitEvent(expert_stream_, expert_fork_, 0));
-      Experts(L, n, expert_stream_);
-      HIP_CHECK(hipEventRecord(expert_join_, expert_stream_));
+      if (!experts_after_dense) {
+        Experts(L, n, expert_stream_);
+        HIP_CHECK(hipEventRecord(expert_join_, expert_stream_));
+      }
     }
     const void* gq = nullptr;
     const float* down_in = gate_;
@@ -1079,6 +1084,10 @@ void Executor::Forward(std::span<const Segment> segments,
       }
     }
     Project(L.ffn_down, down_in, gq, n, o_, down_pack.hi != nullptr);
+    if (experts_after_dense) {
+      Experts(L, n, expert_stream_);
+      HIP_CHECK(hipEventRecord(expert_join_, expert_stream_));
+    }
     const bool last = l + 1 == c.num_layers;
     // At decode widths the layer's last norm packs the next layer's input for
     // its WMMA Q/K/V projections (the vocabulary head after the last layer
@@ -1272,7 +1281,20 @@ void Executor::Experts(const DeviceLayer& l, std::uint32_t n,
   }
   MoeRoute(route, stream);
   route.raw_logits = false;
-  if (grouped || !PrefillExperts(l, n, stream)) {
+  ExpertWeights w{l.gate_up_exps.data, l.down_exps.data};
+  if (l.expert_stream_layer >= 0) {
+    // Prepare reads the routes once `stream` reaches them, stages the
+    // missing experts, and queues the layer's tables on `stream`.
+    const void* tables[2] = {};
+    if (!model_.expert_store()->Prepare(
+            static_cast<std::uint32_t>(l.expert_stream_layer), moe_ids_, n,
+            tables, nullptr, nullptr, nullptr, stream)) {
+      throw std::runtime_error("gemma4 expert streaming failed");
+    }
+    w = {nullptr, nullptr, static_cast<const void* const*>(tables[0]),
+         static_cast<const void* const*>(tables[1])};
+  }
+  if (grouped || !PrefillExperts(l, w, n, stream)) {
     // Grouped FP32 projections; a prefill whose formats lack the binary16
     // route runs them over 16-row pieces.
     const auto gate_up = ExpertFormatOf(l.gate_up_exps.type);
@@ -1293,23 +1315,23 @@ void Executor::Experts(const DeviceLayer& l, std::uint32_t n,
       auto* act = static_cast<float*>(moe_act_);
       // The gate/up projection applies GeGLU in its epilogue.
       if (!gate_up || !down ||
-          !LaunchRoutedGemv(*gate_up, l.gate_up_exps.data, moe_groups_,
-                            max_groups, moe_h_ + std::size_t{r0} * d, used, act,
-                            2 * width, d, stream, true, rows == 1)) {
+          !LaunchRoutedGemv(*gate_up, w.gate_up, moe_groups_, max_groups,
+                            moe_h_ + std::size_t{r0} * d, used, act, 2 * width,
+                            d, stream, true, rows == 1, w.gate_up_table)) {
         throw std::runtime_error("gemma4 expert gate/up format unsupported");
       }
       // One row: every expert group holds a single slot.
-      if (!LaunchRoutedGemv(*down, l.down_exps.data, moe_groups_, max_groups,
-                            act, 1, moe_out_ + std::size_t{r0} * used * d, d,
-                            width, stream, false, rows == 1)) {
+      if (!LaunchRoutedGemv(*down, w.down, moe_groups_, max_groups, act, 1,
+                            moe_out_ + std::size_t{r0} * used * d, d, width,
+                            stream, false, rows == 1, w.down_table)) {
         throw std::runtime_error("gemma4 expert down format unsupported");
       }
     }
   }
 }
 
-bool Executor::PrefillExperts(const DeviceLayer& l, std::uint32_t n,
-                              hipStream_t stream) {
+bool Executor::PrefillExperts(const DeviceLayer& l, const ExpertWeights& w,
+                              std::uint32_t n, hipStream_t stream) {
   const Config& c = model_.config();
   const std::uint32_t d = c.hidden_size;
   const std::uint32_t used = c.experts_used;
@@ -1352,31 +1374,32 @@ bool Executor::PrefillExperts(const DeviceLayer& l, std::uint32_t n,
     const bool compact =
         l.gate_up_exps.prefill_layout == PrefillLayout::kCompact;
     if (!LaunchRoutedHalfGemm(
-            *own_format, compact ? l.gate_up_exps.prefill : l.gate_up_exps.data,
-            x_half, moe_tiles_, tiles, gate_up_rows, moe_bounds_,
-            moe_rows_token_, moe_rows_slot_, nullptr, act, 2 * width, d, stream,
-            true, l.gate_up_exps.prefill_layout)) {
+            *own_format, compact ? l.gate_up_exps.prefill : w.gate_up, x_half,
+            moe_tiles_, tiles, gate_up_rows, moe_bounds_, moe_rows_token_,
+            moe_rows_slot_, nullptr, act, 2 * width, d, stream, true,
+            l.gate_up_exps.prefill_layout, w.gate_up_table)) {
       return false;
     }
   } else {
-    if (!rocm::RoutedF16Gemm(
-            l.gate_up_exps.data, *gate_up, static_cast<const __half*>(x_half),
-            moe_tiles_, tiles, kRoutedTileRows, moe_bounds_, moe_rows_token_,
-            moe_rows_slot_, nullptr, gu, 2 * width, d, stream)) {
+    if (!rocm::RoutedF16Gemm(w.gate_up, *gate_up,
+                             static_cast<const __half*>(x_half), moe_tiles_,
+                             tiles, kRoutedTileRows, moe_bounds_,
+                             moe_rows_token_, moe_rows_slot_, nullptr, gu,
+                             2 * width, d, stream, w.gate_up_table)) {
       return false;
     }
     GeGluPackedHalf(gu, act, n * used, width, stream);
   }
   if (own_down) {
-    return LaunchRoutedHalfGemm(*down_format, l.down_exps.data, act, down_map,
-                                down_tiles, down_rows, moe_bounds_,
-                                moe_rows_slot_, moe_rows_slot_, moe_out_,
-                                nullptr, d, width, stream);
+    return LaunchRoutedHalfGemm(
+        *down_format, w.down, act, down_map, down_tiles, down_rows, moe_bounds_,
+        moe_rows_slot_, moe_rows_slot_, moe_out_, nullptr, d, width, stream,
+        false, PrefillLayout::kNone, w.down_table);
   }
-  return rocm::RoutedF16Gemm(l.down_exps.data, *down, act, down_map, down_tiles,
+  return rocm::RoutedF16Gemm(w.down, *down, act, down_map, down_tiles,
                              kRoutedDownRows, moe_bounds_, moe_rows_slot_,
                              moe_rows_slot_, moe_out_, nullptr, d, width,
-                             stream);
+                             stream, w.down_table);
 }
 
 void Executor::BeforeMutation(KvCache& cache) {

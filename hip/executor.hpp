@@ -280,11 +280,21 @@ private:
   /// Routed experts of layer `l` for the n rows of the attention residual
   /// x_ and their expert input moe_h_: routing weights in moe_weights_,
   /// every slot's output in moe_out_ (mixed by MoeFinish).
+  /// A streamed layer's experts are staged after routing, which waits on
+  /// the host for the routes.
   void Experts(const DeviceLayer& l, std::uint32_t n, hipStream_t stream);
+  /// One layer's expert weights: stacked tensors, or (streamed) per-expert
+  /// device tables with null bases.
+  struct ExpertWeights {
+    const void* gate_up{nullptr};
+    const void* down{nullptr};
+    const void* const* gate_up_table{nullptr};
+    const void* const* down_table{nullptr};
+  };
   /// Prefill route of Experts: binary16 expert GEMMs over rows compacted
   /// by expert. Returns false when a weight format lacks that route.
-  bool PrefillExperts(const DeviceLayer& l, std::uint32_t n,
-                      hipStream_t stream);
+  bool PrefillExperts(const DeviceLayer& l, const ExpertWeights& w,
+                      std::uint32_t n, hipStream_t stream);
   [[nodiscard]] bool DerivedKeys(std::uint32_t layer) const;
   /// Marks `att` as a derived-key layer.
   void DeriveKeys(AttentionArgs& att, std::uint32_t layer) const;

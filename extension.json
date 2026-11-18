@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "gemma4",
   "version": "0.2.0",
-  "api_version": ">= 0.3.20",
+  "api_version": ">= 0.3.28",
   "entry": "gemma4_register",
   "registration_target": "gufo_gemma4",
   "depends": [],
@@ -51,6 +51,20 @@
       "commands": ["serve", "bench", "prompt", "chat"],
       "providers": ["gemma4"],
       "help": "Prefill copies of the projections: off, compact or decoded (default: off)"
+    },
+    {
+      "name": "--stream-experts",
+      "type": "boolean",
+      "commands": ["serve", "bench", "prompt", "chat"],
+      "providers": ["gemma4"],
+      "help": "Keep dense weights resident and stream routed experts from the GGUF through a bounded cache"
+    },
+    {
+      "name": "--expert-cache-bytes",
+      "type": "integer",
+      "commands": ["serve", "bench", "prompt", "chat"],
+      "providers": ["gemma4"],
+      "help": "With --stream-experts: streamed expert cache bytes (default: what the upload leaves)"
     },
     {
       "name": "--image-tokens",

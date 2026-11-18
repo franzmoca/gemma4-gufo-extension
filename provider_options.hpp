@@ -30,6 +30,17 @@ inline void ApplyProviderOptions(const ext::ParsedOptions& given,
           FindOption<std::string>(given, "--prefill-weights")) {
     options.prefill_weights = ParsePrefillWeightsOption(*layout);
   }
+  if (const auto* stream = FindOption<bool>(given, "--stream-experts")) {
+    options.stream_experts = *stream;
+  }
+  if (const auto* bytes =
+          FindOption<std::int64_t>(given, "--expert-cache-bytes")) {
+    if (*bytes <= 0 || !options.stream_experts) {
+      throw std::invalid_argument(
+          "--expert-cache-bytes takes a positive size with --stream-experts");
+    }
+    options.expert_cache_bytes = static_cast<std::uint64_t>(*bytes);
+  }
 }
 
 /// The soft-token budget per image (`--image-tokens`, default 280). Throws

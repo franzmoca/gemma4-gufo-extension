@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/weight_upload.hpp>
@@ -75,6 +76,14 @@ PrefillLayout ChoosePrefillLayout(PrefillWeights mode, ExpertFormat format,
 /// stay inside the allocation.
 constexpr std::size_t kTailMargin = 4096;
 
+/// Routed experts the kernels read in their GGUF encoding, so they can
+/// stream; BF16 converts to binary16 at upload and stays resident.
+bool StreamableExperts(const LayerWeights& l) {
+  return !l.gate_up_exps.empty() && !l.down_exps.empty() &&
+         l.gate_up_exps.type != core::GgmlType::kBF16 &&
+         l.down_exps.type != core::GgmlType::kBF16;
+}
+
 struct Uploader {
   hip::WeightUpload& stager;
   const hip::WeightAllocator& weights;
@@ -83,6 +92,10 @@ struct Uploader {
   std::size_t& max_cols;
   std::string* error;
   std::uint32_t shard_base{0};
+  /// With streaming: the target's shards, and the layout the streamed
+  /// layers join.
+  const std::vector<core::GgufMappedRegion>* shards{nullptr};
+  expert_stream::Layout* stream_layout{nullptr};
   bool ok{true};
   /// BF16 layer tensors to rewrite as binary16 once uploaded.
   struct HalfConversion {
@@ -137,6 +150,22 @@ struct Uploader {
     if (t.type != core::GgmlType::kF32) {
       max_cols = std::max<std::size_t>(max_cols, t.cols);
     }
+    return d;
+  }
+
+  /// Whether `l`'s routed experts stream: the target's, when streaming.
+  [[nodiscard]] bool Streams(const LayerWeights& l) const {
+    return stream_layout != nullptr && shard_base == 0 && StreamableExperts(l);
+  }
+
+  /// A streamed tensor: its shape and format, no data.
+  DeviceTensor Describe(const TensorRef& t) {
+    DeviceTensor d;
+    d.type = t.type;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = static_cast<std::uint32_t>(t.rows);
+    d.experts = static_cast<std::uint32_t>(t.experts);
+    max_cols = std::max<std::size_t>(max_cols, t.cols);
     return d;
   }
 
@@ -237,8 +266,21 @@ struct Uploader {
     d.pre_ffn_norm_2 = Copy(l.pre_ffn_norm_2);
     d.post_ffn_norm_1 = Copy(l.post_ffn_norm_1);
     d.post_ffn_norm_2 = Copy(l.post_ffn_norm_2);
-    d.gate_up_exps = Copy(l.gate_up_exps);
-    d.down_exps = Copy(l.down_exps);
+    if (Streams(l)) {
+      d.expert_stream_layer =
+          static_cast<std::int32_t>(stream_layout->layers.size());
+      std::vector<expert_stream::Piece> pieces;
+      for (const auto& [t, view] : {std::pair{&l.gate_up_exps, &d.gate_up_exps},
+                                    std::pair{&l.down_exps, &d.down_exps}}) {
+        *view = Describe(*t);
+        pieces.push_back({(*shards)[t->shard].file_descriptor, t->file_offset,
+                          t->SizeBytes() / t->experts});
+      }
+      stream_layout->layers.push_back(std::move(pieces));
+    } else {
+      d.gate_up_exps = Copy(l.gate_up_exps);
+      d.down_exps = Copy(l.down_exps);
+    }
     d.down_exps_scale = Copy(l.down_exps_scale);
     // Binary16 kernels serve the BF16 projections and experts: fused tensors
     // convert once with their views.
@@ -293,7 +335,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& weights, const core::GgufReader& reader,
     const DraftWeights* draft, const core::GgufReader* draft_reader,
     std::span<const std::int32_t> draft_order, PrefillWeights prefill_weights,
-    std::string* error_msg) {
+    std::string* error_msg, ExpertStreaming streaming) {
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = weights.config;
   m->vocab_ = weights.vocab_size;
@@ -320,9 +362,23 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   for (const auto& shard : shards) {
     file_bytes += shard.size;
   }
-  const hip::WeightAllocator placement(file_bytes);
+  // Streamed experts stay in the files: the placement counts what uploads.
+  expert_stream::Layout stream_layout;
+  std::uint64_t streamed_bytes = 0;
+  if (streaming.enabled) {
+    for (const auto& l : weights.layers) {
+      if (StreamableExperts(l)) {
+        streamed_bytes += l.gate_up_exps.SizeBytes() + l.down_exps.SizeBytes();
+      }
+    }
+  }
+  const hip::WeightAllocator placement(file_bytes - streamed_bytes);
   Uploader up{*stager,   placement,    m->allocations_,
               m->bytes_, m->max_cols_, error_msg};
+  if (streaming.enabled) {
+    up.shards = &shards;
+    up.stream_layout = &stream_layout;
+  }
   m->token_embd_ = up.Copy(weights.token_embd);
   m->output_ = weights.TiedOutput() ? m->token_embd_ : up.Copy(weights.output);
   m->output_norm_ = up.Copy(weights.output_norm);
@@ -662,6 +718,30 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       *error_msg = "router scaling failed";
     }
     return nullptr;
+  }
+  if (!stream_layout.layers.empty()) {
+    // Both pieces of a layer's expert: [gate | up] rows, then down rows. The
+    // kernels' whole k-iterations read up to the upload tail past them.
+    const Config& c = m->config_;
+    stream_layout.experts = c.num_experts;
+    stream_layout.top_k = c.experts_used;
+    stream_layout.pieces = 2;
+    stream_layout.max_batch_tokens = kMaxGroupSlots;
+    stream_layout.read_margin_bytes = kTailMargin;
+    expert_stream::Policy policy;
+    policy.cache_limit_bytes = streaming.cache_bytes;
+    policy.log_tag = "gemma4";
+    if (const char* path = std::getenv("GEMMA4_EXPERT_TRACE");
+        path != nullptr && *path != '\0') {
+      policy.trace_path = path;
+    }
+    m->expert_store_ = expert_stream::Store::Create(stream_layout, policy);
+    if (!m->expert_store_) {
+      if (error_msg != nullptr) {
+        *error_msg = "the streamed expert store could not be created";
+      }
+      return nullptr;
+    }
   }
   return m;
 }

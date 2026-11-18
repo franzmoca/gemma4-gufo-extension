@@ -69,6 +69,11 @@ struct ModelOptions {
   std::string draft_trace_path;
   /// Prefill copies of the dense projections (memory for prefill speed).
   PrefillWeights prefill_weights = PrefillWeights::kOff;
+  /// Stream the target's routed experts from the GGUF through a bounded
+  /// device cache instead of uploading them (expert models only).
+  bool stream_experts = false;
+  /// With stream_experts: the cache bound; 0 sizes it from the memory left.
+  std::uint64_t expert_cache_bytes = 0;
 };
 
 class Session;

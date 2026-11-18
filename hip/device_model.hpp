@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/experimental/expert_stream.hpp>
 #include <gufo/ext/gguf_reader.hpp>
 #include <memory>
 #include <span>
@@ -49,6 +50,18 @@ struct DeviceLayer {
   // Routed experts (see LayerWeights); empty on dense models.
   DeviceTensor router, router_scale, pre_ffn_norm_2, post_ffn_norm_1,
       post_ffn_norm_2, gate_up_exps, down_exps, down_exps_scale;
+  /// The layer's index in the expert store when its routed experts stream
+  /// (gate_up_exps and down_exps then describe the tensors but hold no
+  /// data); -1 when they are resident.
+  std::int32_t expert_stream_layer{-1};
+};
+
+/// Routed experts streamed from the GGUF through a bounded device cache
+/// instead of uploaded (expert_stream::Store).
+struct ExpertStreaming {
+  bool enabled{false};
+  /// Cache bound; 0 sizes it from the memory left after the upload.
+  std::uint64_t cache_bytes{0};
 };
 
 struct DeviceDraft {
@@ -77,7 +90,7 @@ public:
       const ModelWeights& weights, const core::GgufReader& reader,
       const DraftWeights* draft, const core::GgufReader* draft_reader,
       std::span<const std::int32_t> draft_order, PrefillWeights prefill_weights,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr, ExpertStreaming streaming = {});
 
   [[nodiscard]] const Config& config() const noexcept { return config_; }
   [[nodiscard]] std::uint32_t vocab_size() const noexcept { return vocab_; }
@@ -129,6 +142,11 @@ public:
   /// Whether prefill runs on binary16 activations: expert models, and dense
   /// models whose every projection has a binary16 prefill GEMM.
   [[nodiscard]] bool half_prefill() const noexcept { return half_prefill_; }
+  /// The store of the streamed experts (null when every expert is
+  /// resident). Its calls are serialized by the caller.
+  [[nodiscard]] expert_stream::Store* expert_store() const noexcept {
+    return expert_store_.get();
+  }
 
 private:
   DeviceModel() = default;
@@ -149,6 +167,7 @@ private:
   std::size_t max_cols_{0};
   std::size_t max_half_cols_{0};
   bool half_prefill_{false};
+  std::unique_ptr<expert_stream::Store> expert_store_;
 };
 
 }  // namespace gufo::models::gemma4::rocm
