@@ -742,6 +742,23 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       }
       return nullptr;
     }
+    // A cache that holds every streamed expert starts full: reading them all
+    // now keeps first-use reads out of the first requests. Smaller caches
+    // start empty and fill from the requests' routes.
+    uint64_t streamed_bytes = 0;
+    for (const auto& pieces : stream_layout.layers) {
+      for (const expert_stream::Piece& piece : pieces) {
+        streamed_bytes += piece.bytes * c.num_experts;
+      }
+    }
+    if ((streaming.cache_bytes == 0 ||
+         streaming.cache_bytes >= streamed_bytes) &&
+        !m->expert_store_->Seed({}, "every expert")) {
+      if (error_msg != nullptr) {
+        *error_msg = "the streamed experts could not be seeded";
+      }
+      return nullptr;
+    }
   }
   return m;
 }
