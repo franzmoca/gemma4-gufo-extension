@@ -29,15 +29,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1794909316,
-        "narHash": "sha256-BDT5OYA/rsF/QxjD3LsuxBVmYjmE0WM50KBhWGjUMok=",
-        "owner": "gufo-org",
+        "lastModified": 1795058542,
+        "narHash": "sha256-k5Jbj2AO4kjk2nIT1fTOIIlz40Qxz0lHgNcu/D4fNW0=",
+        "owner": "franzmoca",
         "repo": "gufo",
-        "rev": "0260e1162f8713caee4d3f4ff77e017de7165f9c",
+        "rev": "d2b584775b81ddf2d533ef7b971431acf01d20d8",
         "type": "github"
       },
       "original": {
-        "owner": "gufo-org",
+        "owner": "franzmoca",
+        "ref": "feat/expert-stream",
         "repo": "gufo",
         "type": "github"
       }

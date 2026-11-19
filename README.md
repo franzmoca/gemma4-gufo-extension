@@ -27,6 +27,11 @@ with the GGUF file name when a model does not load.
   Gufo ignores `--draft-tokens`, `--min-draft-tokens` and `--draft-policy`
   since [#1124](https://github.com/gufo-org/gufo/pull/1124).
 
+- Experimental, on the `feat/expert-stream` branch only: `--stream-experts`
+  and `--expert-cache-bytes` stream the 26B-A4B's routed experts from the
+  GGUF through Gufo's experimental expert store
+  ([26B-A4B streaming](docs/models/gemma-4-26b-a4b/STREAMING.md)).
+
 Benchmarks and quality reports are in the model cards:
 [26B-A4B](docs/models/gemma-4-26b-a4b/README.md),
 [31B](docs/models/gemma-4-31b/README.md) and
