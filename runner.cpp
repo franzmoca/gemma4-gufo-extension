@@ -389,13 +389,19 @@ public:
     if (!rendered) {
       throw std::invalid_argument("Gemma 4 chat template: " + error);
     }
+    // Request text keeps its special-token spellings as text.
+    const auto tokenize = [&](std::size_t from) {
+      const auto tokens = model_->tokenizer().Encode(
+          std::string_view(rendered->text).substr(from), false, true,
+          rendered->content_spans, from);
+      return std::vector<TextRunnerToken>(tokens.begin(), tokens.end());
+    };
     ext::TextPreparedPrompt prepared;
-    prepared.tokens = Tokenize(rendered->text);
+    prepared.tokens = tokenize(0);
     // The stable prefix is shared by the next turn; the text after it starts
     // with a special token, so it tokenizes apart.
     if (rendered->stable_prefix_offset < rendered->text.size()) {
-      const auto suffix = Tokenize(std::string_view(rendered->text)
-                                       .substr(rendered->stable_prefix_offset));
+      const auto suffix = tokenize(rendered->stable_prefix_offset);
       if (suffix.size() < prepared.tokens.size() &&
           std::equal(suffix.begin(), suffix.end(),
                      prepared.tokens.end() -
