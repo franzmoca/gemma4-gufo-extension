@@ -21,12 +21,14 @@ gufo serve llm -m gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf --stream-experts \
 - `--stream-experts` streams every layer's routed `[gate | up]` and down
   tensors; BF16 expert tensors (layer 29 of UD-Q8_K_XL) stay resident.
 - `--expert-cache-bytes N` bounds the cache (it requires `--stream-experts`).
-  Without it, serving sizes the cache from the memory left after the sessions
-  and the prompt cache (the runner declares 2 GiB of headroom and 1 GiB of
-  prompt cache per session).
-- When the cache can hold every streamed expert, they are all read at startup
-  (UD-Q4_K_XL 13.4 GiB in about 3 s, UD-Q8_K_XL 21.9 GiB in about 6 s), so
-  the first requests do not wait on reads. Smaller caches start empty.
+  Without it, the cache takes the memory left: serving sizes it after the
+  sessions and the prompt cache (the runner declares 2 GiB of headroom and
+  1 GiB of prompt cache per session), and `gufo prompt` and `gufo bench`
+  right after loading, leaving 2 GiB free.
+- Once sized, the cache is filled at startup with experts interleaved across
+  layers, so the first requests wait less on reads. A cache that holds every
+  streamed expert starts with all of them (UD-Q4_K_XL 13.4 GiB in about 3 s,
+  UD-Q8_K_XL 21.9 GiB in about 6 s); a 4 GiB cache fills in about 1 s.
 - `GEMMA4_EXPERT_TRACE=PATH` writes the store's routing trace, which Gufo's
   `tools/expert_stream/` replays offline.
 
@@ -71,7 +73,7 @@ first use. Smaller caches fall steeply: misses are read on demand at
 ## Not done
 
 - Prefetch for partial caches (`Store::Predict` from the router's next-layer
-  scores, as DeepSeek V4.1 Flash does) and a seed order from routing
-  histograms; both would raise the partial-cache rows above.
+  scores, as DeepSeek V4.1 Flash does) and a ranking from routing
+  histograms (`Policy::ranking`); both would raise the partial-cache rows above.
 - An expert-tails file on a second drive (`Store::AttachTails`).
 - The functional suites and the Pi agent replay were not run with streaming.

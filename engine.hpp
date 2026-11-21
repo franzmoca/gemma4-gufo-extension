@@ -49,6 +49,10 @@ inline constexpr std::uint32_t kDefaultDraftTokens = 15;
 /// frontier (Session::Sync).
 inline constexpr std::size_t kLookaheadRows = 64;
 
+/// With streamed experts, host memory the expert cache leaves free: buffers
+/// and transient peaks the first requests still allocate.
+inline constexpr std::size_t kExpertHeadroomBytes = std::size_t{2} << 30;
+
 struct ModelOptions {
   /// Largest context any session may use.
   std::uint32_t max_context = 4096;
@@ -205,7 +209,15 @@ public:
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
   /// The streamed experts' store (ModelOptions::stream_experts), or null.
+  /// Its cache is empty until sized and filled, every expert interleaved
+  /// across layers: by serving once the sessions exist, or by
+  /// FitExpertCache.
   [[nodiscard]] expert_stream::Store* ExpertStore() const noexcept;
+  /// Without serving (`gufo prompt`, `gufo bench`): sizes and fills the
+  /// streamed expert cache from the memory available now, leaving
+  /// kExpertHeadroomBytes free; call right after Load. True without
+  /// streamed experts.
+  bool FitExpertCache();
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
   /// Sliding-window ring slots per session (window + prefill chunk).
   [[nodiscard]] std::size_t SessionRingSlots() const noexcept;

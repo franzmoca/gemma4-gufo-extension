@@ -10,6 +10,7 @@
 #include <exception>
 #include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/host.hpp>
+#include <gufo/ext/host_budget.hpp>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -361,6 +362,18 @@ const Config& Model::config() const noexcept {
 
 expert_stream::Store* Model::ExpertStore() const noexcept {
   return device_->expert_store();
+}
+
+bool Model::FitExpertCache() {
+  expert_stream::Store* store = ExpertStore();
+  if (store == nullptr) {
+    return true;
+  }
+  const std::uint64_t available = ext::HostAvailableBytes();
+  return store->Fit(store->GetStats().cache_bytes +
+                    (available > kExpertHeadroomBytes
+                         ? available - kExpertHeadroomBytes
+                         : 0));
 }
 
 std::size_t Model::ResidentBytes() const noexcept {

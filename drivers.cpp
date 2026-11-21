@@ -116,6 +116,10 @@ std::shared_ptr<Model> LoadModel(const ext::TextPromptOptions& opt,
   }
   std::string error;
   auto model = Model::Load(opt.model_path, options, &error);
+  if (model != nullptr && !model->FitExpertCache()) {
+    model = nullptr;
+    error = "the streamed expert cache could not be filled";
+  }
   if (model == nullptr) {
     std::cerr << "Error loading Gemma 4 model: " << error << '\n';
     PrintModelLoadTime(start, false);
@@ -444,6 +448,10 @@ int RunGemma4Bench(const ext::TextBenchOptions& options,
   }
   std::string error;
   auto model = Model::Load(options.model_path, model_options, &error);
+  if (model != nullptr && !model->FitExpertCache()) {
+    model = nullptr;
+    error = "the streamed expert cache could not be filled";
+  }
   if (model == nullptr) {
     std::cerr << "Error creating Gemma 4 model: " << error << '\n';
     PrintModelLoadTime(model_load_start, false);
